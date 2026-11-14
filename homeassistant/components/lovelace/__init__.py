@@ -1,574 +1,395 @@
-"""Lovelace UI."""
+"""Support for the Lovelace UI."""
+
+from contextlib import suppress
+from dataclasses import dataclass
 import logging
-import uuid
 import os
-from os import O_CREAT, O_TRUNC, O_WRONLY
-from collections import OrderedDict
-from typing import Dict, List, Union
+from typing import Any
 
-import voluptuous as vol
+import probatio
 
-from homeassistant.components import websocket_api
+from homeassistant.components import frontend, onboarding, websocket_api
+from homeassistant.const import CONF_FILENAME, CONF_ICON, CONF_MODE, CONF_RESOURCES
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.exceptions import HomeAssistantError
+from homeassistant.helpers import collection, config_validation as cv
+from homeassistant.helpers.storage import Store
+from homeassistant.helpers.translation import async_get_translations
+from homeassistant.helpers.typing import ConfigType
+from homeassistant.util import slugify
+
+from . import dashboard, resources, websocket
+from .const import (
+    CONF_ALLOW_SINGLE_WORD,
+    CONF_REQUIRE_ADMIN,
+    CONF_RESOURCE_MODE,
+    CONF_SHOW_IN_SIDEBAR,
+    CONF_TITLE,
+    CONF_URL_PATH,
+    DASHBOARD_BASE_CREATE_FIELDS,
+    DEFAULT_ICON,
+    DOMAIN,
+    LOVELACE_DATA,
+    MODE_STORAGE,
+    MODE_YAML,
+    RESOURCE_CREATE_FIELDS,
+    RESOURCE_SCHEMA,
+    RESOURCE_UPDATE_FIELDS,
+    SERVICE_RELOAD_RESOURCES,
+    STORAGE_DASHBOARD_CREATE_FIELDS,
+    STORAGE_DASHBOARD_UPDATE_FIELDS,
+    LovelaceService,
+)
+from .services import async_setup_services
 
 _LOGGER = logging.getLogger(__name__)
-DOMAIN = 'lovelace'
-REQUIREMENTS = ['ruamel.yaml==0.15.72']
 
-LOVELACE_CONFIG_FILE = 'ui-lovelace.yaml'
-JSON_TYPE = Union[List, Dict, str]  # pylint: disable=invalid-name
-
-FORMAT_YAML = 'yaml'
-FORMAT_JSON = 'json'
-
-OLD_WS_TYPE_GET_LOVELACE_UI = 'frontend/lovelace_config'
-WS_TYPE_GET_LOVELACE_UI = 'lovelace/config'
-
-WS_TYPE_MIGRATE_CONFIG = 'lovelace/config/migrate'
-WS_TYPE_GET_CARD = 'lovelace/config/card/get'
-WS_TYPE_UPDATE_CARD = 'lovelace/config/card/update'
-WS_TYPE_ADD_CARD = 'lovelace/config/card/add'
-WS_TYPE_MOVE_CARD = 'lovelace/config/card/move'
-WS_TYPE_DELETE_CARD = 'lovelace/config/card/delete'
-
-SCHEMA_GET_LOVELACE_UI = websocket_api.BASE_COMMAND_MESSAGE_SCHEMA.extend({
-    vol.Required('type'): vol.Any(WS_TYPE_GET_LOVELACE_UI,
-                                  OLD_WS_TYPE_GET_LOVELACE_UI),
-})
-
-SCHEMA_MIGRATE_CONFIG = websocket_api.BASE_COMMAND_MESSAGE_SCHEMA.extend({
-    vol.Required('type'): WS_TYPE_MIGRATE_CONFIG,
-})
-
-SCHEMA_GET_CARD = websocket_api.BASE_COMMAND_MESSAGE_SCHEMA.extend({
-    vol.Required('type'): WS_TYPE_GET_CARD,
-    vol.Required('card_id'): str,
-    vol.Optional('format', default=FORMAT_YAML): vol.Any(FORMAT_JSON,
-                                                         FORMAT_YAML),
-})
-
-SCHEMA_UPDATE_CARD = websocket_api.BASE_COMMAND_MESSAGE_SCHEMA.extend({
-    vol.Required('type'): WS_TYPE_UPDATE_CARD,
-    vol.Required('card_id'): str,
-    vol.Required('card_config'): vol.Any(str, Dict),
-    vol.Optional('format', default=FORMAT_YAML): vol.Any(FORMAT_JSON,
-                                                         FORMAT_YAML),
-})
-
-SCHEMA_ADD_CARD = websocket_api.BASE_COMMAND_MESSAGE_SCHEMA.extend({
-    vol.Required('type'): WS_TYPE_ADD_CARD,
-    vol.Required('view_id'): str,
-    vol.Required('card_config'): vol.Any(str, Dict),
-    vol.Optional('position'): int,
-    vol.Optional('format', default=FORMAT_YAML): vol.Any(FORMAT_JSON,
-                                                         FORMAT_YAML),
-})
-
-SCHEMA_MOVE_CARD = websocket_api.BASE_COMMAND_MESSAGE_SCHEMA.extend({
-    vol.Required('type'): WS_TYPE_MOVE_CARD,
-    vol.Required('card_id'): str,
-    vol.Optional('new_position'): int,
-    vol.Optional('new_view_id'): str,
-})
-
-SCHEMA_DELETE_CARD = websocket_api.BASE_COMMAND_MESSAGE_SCHEMA.extend({
-    vol.Required('type'): WS_TYPE_DELETE_CARD,
-    vol.Required('card_id'): str,
-})
+__all__ = [
+    "CONF_ICON",
+    "CONF_REQUIRE_ADMIN",
+    "CONF_SHOW_IN_SIDEBAR",
+    "CONF_TITLE",
+    "CONF_URL_PATH",
+    "DOMAIN",
+    "LOVELACE_DATA",
+    "MODE_STORAGE",
+    "SERVICE_RELOAD_RESOURCES",
+    "LovelaceData",
+    "LovelaceService",
+]
 
 
-class WriteError(HomeAssistantError):
-    """Error writing the data."""
+def _validate_url_slug(value: Any) -> str:
+    """Validate value is a valid url slug."""
+    if value is None:
+        raise probatio.Invalid("Slug should not be None")
+    if value != "lovelace" and "-" not in value:
+        raise probatio.Invalid("Url path needs to contain a hyphen (-)")
+    str_value = str(value)
+    slg = slugify(str_value, separator="-")
+    if str_value == slg:
+        return str_value
+    raise probatio.Invalid(f"invalid slug {value} (try {slg})")
 
 
-class CardNotFoundError(HomeAssistantError):
-    """Card not found in data."""
+CONF_DASHBOARDS = "dashboards"
+
+YAML_DASHBOARD_SCHEMA = probatio.Schema(
+    {
+        **DASHBOARD_BASE_CREATE_FIELDS,
+        probatio.Required(CONF_MODE): MODE_YAML,
+        probatio.Required(CONF_FILENAME): cv.path,
+    }
+)
+
+CONFIG_SCHEMA = probatio.Schema(
+    {
+        probatio.Optional(DOMAIN, default={}): probatio.All(
+            # Failing validation would also stop the frontend, which depends on lovelace
+            cv.removed(CONF_MODE, raise_if_present=False),
+            probatio.Schema(
+                {
+                    probatio.Optional(
+                        CONF_RESOURCE_MODE, default=MODE_STORAGE
+                    ): probatio.All(
+                        probatio.Lower, probatio.In([MODE_YAML, MODE_STORAGE])
+                    ),
+                    probatio.Optional(CONF_DASHBOARDS): cv.schema_with_slug_keys(
+                        YAML_DASHBOARD_SCHEMA,
+                        slug_validator=_validate_url_slug,
+                    ),
+                    probatio.Optional(CONF_RESOURCES): [RESOURCE_SCHEMA],
+                }
+            ),
+        )
+    },
+    extra=probatio.ALLOW_EXTRA,
+)
 
 
-class ViewNotFoundError(HomeAssistantError):
-    """View not found in data."""
+@dataclass
+class LovelaceData:
+    """Dataclass to store information in hass.data."""
+
+    resource_mode: str  # The mode used for resources (yaml or storage)
+    dashboards: dict[str | None, dashboard.LovelaceConfig]
+    resources: resources.ResourceYAMLCollection | resources.ResourceStorageCollection
+    yaml_dashboards: dict[str | None, ConfigType]
 
 
-class UnsupportedYamlError(HomeAssistantError):
-    """Unsupported YAML."""
-
-
-class DuplicateIdError(HomeAssistantError):
-    """Duplicate ID's."""
-
-
-def save_yaml(fname: str, data: JSON_TYPE):
-    """Save a YAML file."""
-    from ruamel.yaml import YAML
-    from ruamel.yaml.error import YAMLError
-    yaml = YAML(typ='rt')
-    yaml.indent(sequence=4, offset=2)
-    tmp_fname = fname + "__TEMP__"
-    try:
-        with open(os.open(tmp_fname, O_WRONLY | O_CREAT | O_TRUNC, 0o644),
-                  'w', encoding='utf-8') as temp_file:
-            yaml.dump(data, temp_file)
-        os.replace(tmp_fname, fname)
-    except YAMLError as exc:
-        _LOGGER.error(str(exc))
-        raise HomeAssistantError(exc)
-    except OSError as exc:
-        _LOGGER.exception('Saving YAML file %s failed: %s', fname, exc)
-        raise WriteError(exc)
-    finally:
-        if os.path.exists(tmp_fname):
-            try:
-                os.remove(tmp_fname)
-            except OSError as exc:
-                # If we are cleaning up then something else went wrong, so
-                # we should suppress likely follow-on errors in the cleanup
-                _LOGGER.error("YAML replacement cleanup failed: %s", exc)
-
-
-def _yaml_unsupported(loader, node):
-    raise UnsupportedYamlError(
-        'Unsupported YAML, you can not use {} in ui-lovelace.yaml'
-        .format(node.tag))
-
-
-def load_yaml(fname: str) -> JSON_TYPE:
-    """Load a YAML file."""
-    from ruamel.yaml import YAML
-    from ruamel.yaml.constructor import RoundTripConstructor
-    from ruamel.yaml.error import YAMLError
-
-    RoundTripConstructor.add_constructor(None, _yaml_unsupported)
-
-    yaml = YAML(typ='rt')
-
-    try:
-        with open(fname, encoding='utf-8') as conf_file:
-            # If configuration file is empty YAML returns None
-            # We convert that to an empty dict
-            return yaml.load(conf_file) or OrderedDict()
-    except YAMLError as exc:
-        _LOGGER.error("YAML error in %s: %s", fname, exc)
-        raise HomeAssistantError(exc)
-    except UnicodeDecodeError as exc:
-        _LOGGER.error("Unable to read file %s: %s", fname, exc)
-        raise HomeAssistantError(exc)
-
-
-def load_config(fname: str) -> JSON_TYPE:
-    """Load a YAML file."""
-    return load_yaml(fname)
-
-
-def migrate_config(fname: str) -> JSON_TYPE:
-    """Load a YAML file and adds id to views and cards if not present."""
-    config = load_yaml(fname)
-    # Check if all views and cards have a unique id or else add one
-    updated = False
-    seen_card_ids = set()
-    seen_view_ids = set()
-    index = 0
-    for view in config.get('views', []):
-        view_id = view.get('id')
-        if view_id is None:
-            updated = True
-            view.insert(0, 'id', index,
-                        comment="Automatically created id")
-        else:
-            if view_id in seen_view_ids:
-                raise DuplicateIdError(
-                    'ID `{}` has multiple occurances in views'.format(view_id))
-            seen_view_ids.add(view_id)
-        for card in view.get('cards', []):
-            card_id = card.get('id')
-            if card_id is None:
-                updated = True
-                card.insert(0, 'id', uuid.uuid4().hex,
-                            comment="Automatically created id")
-            else:
-                if card_id in seen_card_ids:
-                    raise DuplicateIdError(
-                        'ID `{}` has multiple occurances in cards'
-                        .format(card_id))
-                seen_card_ids.add(card_id)
-        index += 1
-    if updated:
-        save_yaml(fname, config)
-    return config
-
-
-def object_to_yaml(data: JSON_TYPE) -> str:
-    """Create yaml string from object."""
-    from ruamel.yaml import YAML
-    from ruamel.yaml.error import YAMLError
-    from ruamel.yaml.compat import StringIO
-    yaml = YAML(typ='rt')
-    yaml.indent(sequence=4, offset=2)
-    stream = StringIO()
-    try:
-        yaml.dump(data, stream)
-        return stream.getvalue()
-    except YAMLError as exc:
-        _LOGGER.error("YAML error: %s", exc)
-        raise HomeAssistantError(exc)
-
-
-def yaml_to_object(data: str) -> JSON_TYPE:
-    """Create object from yaml string."""
-    from ruamel.yaml import YAML
-    from ruamel.yaml.error import YAMLError
-    yaml = YAML(typ='rt')
-    try:
-        return yaml.load(data)
-    except YAMLError as exc:
-        _LOGGER.error("YAML error: %s", exc)
-        raise HomeAssistantError(exc)
-
-
-def get_card(fname: str, card_id: str, data_format: str = FORMAT_YAML)\
-        -> JSON_TYPE:
-    """Load a specific card config for id."""
-    config = load_yaml(fname)
-    for view in config.get('views', []):
-        for card in view.get('cards', []):
-            if str(card.get('id')) != card_id:
-                continue
-            if data_format == FORMAT_YAML:
-                return object_to_yaml(card)
-            return card
-
-    raise CardNotFoundError(
-        "Card with ID: {} was not found in {}.".format(card_id, fname))
-
-
-def update_card(fname: str, card_id: str, card_config: str,
-                data_format: str = FORMAT_YAML):
-    """Save a specific card config for id."""
-    config = load_yaml(fname)
-    for view in config.get('views', []):
-        for card in view.get('cards', []):
-            if str(card.get('id')) != card_id:
-                continue
-            if data_format == FORMAT_YAML:
-                card_config = yaml_to_object(card_config)
-            card.update(card_config)
-            save_yaml(fname, config)
-            return
-
-    raise CardNotFoundError(
-        "Card with ID: {} was not found in {}.".format(card_id, fname))
-
-
-def add_card(fname: str, view_id: str, card_config: str,
-             position: int = None, data_format: str = FORMAT_YAML):
-    """Add a card to a view."""
-    config = load_yaml(fname)
-    for view in config.get('views', []):
-        if str(view.get('id')) != view_id:
-            continue
-        cards = view.get('cards', [])
-        if data_format == FORMAT_YAML:
-            card_config = yaml_to_object(card_config)
-        if position is None:
-            cards.append(card_config)
-        else:
-            cards.insert(position, card_config)
-        save_yaml(fname, config)
-        return
-
-    raise ViewNotFoundError(
-        "View with ID: {} was not found in {}.".format(view_id, fname))
-
-
-def move_card(fname: str, card_id: str, position: int = None):
-    """Move a card to a different position."""
-    if position is None:
-        raise HomeAssistantError('Position is required if view is not\
-                                 specified.')
-    config = load_yaml(fname)
-    for view in config.get('views', []):
-        for card in view.get('cards', []):
-            if str(card.get('id')) != card_id:
-                continue
-            cards = view.get('cards')
-            cards.insert(position, cards.pop(cards.index(card)))
-            save_yaml(fname, config)
-            return
-
-    raise CardNotFoundError(
-        "Card with ID: {} was not found in {}.".format(card_id, fname))
-
-
-def move_card_view(fname: str, card_id: str, view_id: str,
-                   position: int = None):
-    """Move a card to a different view."""
-    config = load_yaml(fname)
-    for view in config.get('views', []):
-        if str(view.get('id')) == view_id:
-            destination = view.get('cards')
-        for card in view.get('cards'):
-            if str(card.get('id')) != card_id:
-                continue
-            origin = view.get('cards')
-            card_to_move = card
-
-    if 'destination' not in locals():
-        raise ViewNotFoundError(
-            "View with ID: {} was not found in {}.".format(view_id, fname))
-    if 'card_to_move' not in locals():
-        raise CardNotFoundError(
-            "Card with ID: {} was not found in {}.".format(card_id, fname))
-
-    origin.pop(origin.index(card_to_move))
-
-    if position is None:
-        destination.append(card_to_move)
-    else:
-        destination.insert(position, card_to_move)
-
-    save_yaml(fname, config)
-
-
-def delete_card(fname: str, card_id: str, position: int = None):
-    """Delete a card from view."""
-    config = load_yaml(fname)
-    for view in config.get('views', []):
-        for card in view.get('cards', []):
-            if str(card.get('id')) != card_id:
-                continue
-            cards = view.get('cards')
-            cards.pop(cards.index(card))
-            save_yaml(fname, config)
-            return
-
-    raise CardNotFoundError(
-        "Card with ID: {} was not found in {}.".format(card_id, fname))
-
-
-async def async_setup(hass, config):
+async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
     """Set up the Lovelace commands."""
-    # Backwards compat. Added in 0.80. Remove after 0.85
-    hass.components.websocket_api.async_register_command(
-        OLD_WS_TYPE_GET_LOVELACE_UI, websocket_lovelace_config,
-        SCHEMA_GET_LOVELACE_UI)
+    yaml_resources = config[DOMAIN].get(CONF_RESOURCES)
+    resource_mode = config[DOMAIN][CONF_RESOURCE_MODE]
 
-    hass.components.websocket_api.async_register_command(
-        WS_TYPE_MIGRATE_CONFIG, websocket_lovelace_migrate_config,
-        SCHEMA_MIGRATE_CONFIG)
+    resource_collection: (
+        resources.ResourceYAMLCollection | resources.ResourceStorageCollection
+    )
+    default_config = dashboard.LovelaceStorage(hass, None)
 
-    hass.components.websocket_api.async_register_command(
-        WS_TYPE_GET_LOVELACE_UI, websocket_lovelace_config,
-        SCHEMA_GET_LOVELACE_UI)
+    # Load resources based on resource_mode
+    if resource_mode == MODE_YAML:
+        resource_collection = await resources.create_yaml_resource_col(
+            hass, yaml_resources
+        )
 
-    hass.components.websocket_api.async_register_command(
-        WS_TYPE_GET_CARD, websocket_lovelace_get_card,
-        SCHEMA_GET_CARD)
+        # Register lovelace/resources for backwards compatibility, remove in
+        # Home Assistant Core 2025.1
+        for command in ("lovelace/resources", "lovelace/resources/list"):
+            websocket_api.async_register_command(
+                hass,
+                command,
+                websocket.websocket_lovelace_resources,
+                websocket_api.BASE_COMMAND_MESSAGE_SCHEMA.extend(
+                    {"type": command},
+                ),
+            )
 
-    hass.components.websocket_api.async_register_command(
-        WS_TYPE_UPDATE_CARD, websocket_lovelace_update_card,
-        SCHEMA_UPDATE_CARD)
+    else:
+        if yaml_resources is not None:
+            _LOGGER.warning(
+                "Lovelace is running in storage mode. Define resources via user"
+                " interface"
+            )
 
-    hass.components.websocket_api.async_register_command(
-        WS_TYPE_ADD_CARD, websocket_lovelace_add_card,
-        SCHEMA_ADD_CARD)
+        resource_collection = resources.ResourceStorageCollection(hass, default_config)
 
-    hass.components.websocket_api.async_register_command(
-        WS_TYPE_MOVE_CARD, websocket_lovelace_move_card,
-        SCHEMA_MOVE_CARD)
+        resources.ResourceStorageCollectionWebsocket(
+            resource_collection,
+            "lovelace/resources",
+            "resource",
+            RESOURCE_CREATE_FIELDS,
+            RESOURCE_UPDATE_FIELDS,
+        ).async_setup(hass)
 
-    hass.components.websocket_api.async_register_command(
-        WS_TYPE_DELETE_CARD, websocket_lovelace_delete_card,
-        SCHEMA_DELETE_CARD)
+    websocket_api.async_register_command(hass, websocket.websocket_lovelace_info)
+    websocket_api.async_register_command(hass, websocket.websocket_lovelace_config)
+    websocket_api.async_register_command(hass, websocket.websocket_lovelace_save_config)
+    websocket_api.async_register_command(
+        hass, websocket.websocket_lovelace_delete_config
+    )
+
+    yaml_dashboards = config[DOMAIN].get(CONF_DASHBOARDS, {})
+
+    hass.data[LOVELACE_DATA] = LovelaceData(
+        resource_mode=resource_mode,
+        # We store a dictionary mapping url_path: config. None is the default.
+        dashboards={None: default_config},
+        resources=resource_collection,
+        yaml_dashboards=yaml_dashboards,
+    )
+
+    async_setup_services(hass)
+
+    if hass.config.recovery_mode:
+        return True
+
+    async def storage_dashboard_changed(
+        change_type: str, item_id: str, item: dict
+    ) -> None:
+        """Handle a storage dashboard change."""
+        url_path = item[CONF_URL_PATH]
+
+        if change_type == collection.CHANGE_REMOVED:
+            frontend.async_remove_panel(hass, url_path)
+            await hass.data[LOVELACE_DATA].dashboards.pop(url_path).async_delete()
+            # Re-register default lovelace panel if the "lovelace" dashboard was deleted
+            if url_path == DOMAIN:
+                _async_ensure_default_panel(hass)
+            return
+
+        if change_type == collection.CHANGE_ADDED:
+            existing = hass.data[LOVELACE_DATA].dashboards.get(url_path)
+
+            if existing:
+                _LOGGER.warning(
+                    "Cannot register panel at %s, it is already defined in %s",
+                    url_path,
+                    existing,
+                )
+                return
+
+            hass.data[LOVELACE_DATA].dashboards[url_path] = dashboard.LovelaceStorage(
+                hass, item
+            )
+
+            update = False
+        else:
+            hass.data[LOVELACE_DATA].dashboards[url_path].config = item
+            update = True
+
+        try:
+            _register_panel(hass, url_path, MODE_STORAGE, item, update)
+        except ValueError:
+            _LOGGER.warning("Failed to %s panel %s from storage", change_type, url_path)
+
+    # Process YAML dashboards
+    for url_path, dashboard_conf in hass.data[LOVELACE_DATA].yaml_dashboards.items():
+        # For now always mode=yaml
+        lovelace_config = dashboard.LovelaceYAML(hass, url_path, dashboard_conf)
+        hass.data[LOVELACE_DATA].dashboards[url_path] = lovelace_config
+
+        try:
+            _register_panel(hass, url_path, MODE_YAML, dashboard_conf, False)
+        except ValueError:
+            _LOGGER.warning("Panel url path %s is not unique", url_path)
+
+    # Process storage dashboards
+    dashboards_collection = dashboard.DashboardsCollection(hass)
+
+    dashboards_collection.async_add_listener(storage_dashboard_changed)
+    await dashboards_collection.async_load()
+
+    # A YAML dashboard at the default url_path replaces the default storage dashboard
+    if DOMAIN not in hass.data[LOVELACE_DATA].yaml_dashboards:
+        await _async_migrate_default_config(hass, dashboards_collection)
+
+    # Ensure lovelace panel is always registered for backwards compatibility
+    _async_ensure_default_panel(hass)
+
+    dashboard.DashboardsCollectionWebSocket(
+        dashboards_collection,
+        "lovelace/dashboards",
+        "dashboard",
+        STORAGE_DASHBOARD_CREATE_FIELDS,
+        STORAGE_DASHBOARD_UPDATE_FIELDS,
+    ).async_setup(hass)
+
+    def create_map_dashboard() -> None:
+        """Create a map dashboard."""
+        hass.async_create_task(_create_map_dashboard(hass, dashboards_collection))
+
+    if not onboarding.async_is_onboarded(hass):
+        onboarding.async_add_listener(hass, create_map_dashboard)
 
     return True
 
 
-@websocket_api.async_response
-async def websocket_lovelace_config(hass, connection, msg):
-    """Send lovelace UI config over websocket config."""
-    error = None
+@callback
+def _async_ensure_default_panel(hass: HomeAssistant) -> None:
+    """Ensure a default lovelace panel is registered for backward compatibility."""
+    if not frontend.async_panel_exists(hass, DOMAIN):
+        frontend.async_register_built_in_panel(hass, DOMAIN)
+
+
+@callback
+def _register_panel(
+    hass: HomeAssistant, url_path: str | None, mode: str, config: dict, update: bool
+) -> None:
+    """Register a panel."""
+    kwargs = {
+        "frontend_url_path": url_path,
+        "require_admin": config[CONF_REQUIRE_ADMIN],
+        "show_in_sidebar": config[CONF_SHOW_IN_SIDEBAR],
+        "sidebar_title": config[CONF_TITLE],
+        "sidebar_icon": config.get(CONF_ICON, DEFAULT_ICON),
+        "config": {"mode": mode},
+        "update": update,
+    }
+
+    frontend.async_register_built_in_panel(hass, DOMAIN, **kwargs)
+
+
+async def _create_map_dashboard(
+    hass: HomeAssistant, dashboards_collection: dashboard.DashboardsCollection
+) -> None:
+    """Create a map dashboard."""
+    translations = await async_get_translations(
+        hass, hass.config.language, "dashboard", {onboarding.DOMAIN}
+    )
+    title = translations["component.onboarding.dashboard.map.title"]
+
+    await dashboards_collection.async_create_item(
+        {
+            CONF_ALLOW_SINGLE_WORD: True,
+            CONF_ICON: "mdi:map",
+            CONF_TITLE: title,
+            CONF_URL_PATH: "map",
+        }
+    )
+
+    map_store = hass.data[LOVELACE_DATA].dashboards["map"]
+    await map_store.async_save({"strategy": {"type": "map"}})
+
+
+async def _async_migrate_default_config(
+    hass: HomeAssistant, dashboards_collection: dashboard.DashboardsCollection
+) -> None:
+    """Migrate default lovelace storage config to a named dashboard entry.
+
+    This migration:
+    1. Skips if a dashboard with url_path "lovelace" already exists
+    2. Skips if .storage/lovelace has no data
+    3. Creates a new dashboard entry with url_path "lovelace"
+    4. Handles storage files:
+       a. If .storage/lovelace.lovelace does not exist, copies data and removes old file
+       b. If .storage/lovelace.lovelace already exists,
+          renames old file to lovelace_old as backup
+    5. Sets the default panel to "lovelace" if not already configured
+    """
+    # 1. Skip if already migrated (dashboard with url_path "lovelace" exists)
+    for item in dashboards_collection.async_items():
+        if item.get(CONF_URL_PATH) == DOMAIN:
+            return
+
+    # 2. Skip if old storage data does not exist
+    old_store = Store[dict[str, Any]](
+        hass, dashboard.CONFIG_STORAGE_VERSION, dashboard.CONFIG_STORAGE_KEY_DEFAULT
+    )
+    old_data = await old_store.async_load()
+    if old_data is None or old_data.get("config") is None:
+        return
+
+    _LOGGER.info("Migrating default lovelace config to dashboard entry")
+
+    # 3. Create dashboard entry
+    translations = await async_get_translations(
+        hass, hass.config.language, "dashboard", {onboarding.DOMAIN}
+    )
+    title = translations.get(
+        "component.onboarding.dashboard.overview.title", "Overview"
+    )
+
     try:
-        config = await hass.async_add_executor_job(
-            load_config, hass.config.path(LOVELACE_CONFIG_FILE))
-        message = websocket_api.result_message(
-            msg['id'], config
+        await dashboards_collection.async_create_item(
+            {
+                CONF_ALLOW_SINGLE_WORD: True,
+                CONF_ICON: DEFAULT_ICON,
+                CONF_TITLE: title,
+                CONF_URL_PATH: DOMAIN,
+            }
         )
-    except FileNotFoundError:
-        error = ('file_not_found',
-                 'Could not find ui-lovelace.yaml in your config dir.')
-    except UnsupportedYamlError as err:
-        error = 'unsupported_error', str(err)
-    except HomeAssistantError as err:
-        error = 'load_error', str(err)
+    except HomeAssistantError, probatio.Invalid:
+        _LOGGER.exception("Failed to create dashboard entry during migration")
+        return
 
-    if error is not None:
-        message = websocket_api.error_message(msg['id'], *error)
-
-    connection.send_message(message)
-
-
-@websocket_api.async_response
-async def websocket_lovelace_migrate_config(hass, connection, msg):
-    """Migrate lovelace UI config."""
-    error = None
-    try:
-        config = await hass.async_add_executor_job(
-            migrate_config, hass.config.path(LOVELACE_CONFIG_FILE))
-        message = websocket_api.result_message(
-            msg['id'], config
-        )
-    except FileNotFoundError:
-        error = ('file_not_found',
-                 'Could not find ui-lovelace.yaml in your config dir.')
-    except UnsupportedYamlError as err:
-        error = 'unsupported_error', str(err)
-    except HomeAssistantError as err:
-        error = 'load_error', str(err)
-
-    if error is not None:
-        message = websocket_api.error_message(msg['id'], *error)
-
-    connection.send_message(message)
-
-
-@websocket_api.async_response
-async def websocket_lovelace_get_card(hass, connection, msg):
-    """Send lovelace card config over websocket config."""
-    error = None
-    try:
-        card = await hass.async_add_executor_job(
-            get_card, hass.config.path(LOVELACE_CONFIG_FILE), msg['card_id'],
-            msg.get('format', FORMAT_YAML))
-        message = websocket_api.result_message(
-            msg['id'], card
-        )
-    except FileNotFoundError:
-        error = ('file_not_found',
-                 'Could not find ui-lovelace.yaml in your config dir.')
-    except UnsupportedYamlError as err:
-        error = 'unsupported_error', str(err)
-    except CardNotFoundError as err:
-        error = 'card_not_found', str(err)
-    except HomeAssistantError as err:
-        error = 'load_error', str(err)
-
-    if error is not None:
-        message = websocket_api.error_message(msg['id'], *error)
-
-    connection.send_message(message)
-
-
-@websocket_api.async_response
-async def websocket_lovelace_update_card(hass, connection, msg):
-    """Receive lovelace card config over websocket and save."""
-    error = None
-    try:
-        await hass.async_add_executor_job(
-            update_card, hass.config.path(LOVELACE_CONFIG_FILE),
-            msg['card_id'], msg['card_config'], msg.get('format', FORMAT_YAML))
-        message = websocket_api.result_message(
-            msg['id']
-        )
-    except FileNotFoundError:
-        error = ('file_not_found',
-                 'Could not find ui-lovelace.yaml in your config dir.')
-    except UnsupportedYamlError as err:
-        error = 'unsupported_error', str(err)
-    except CardNotFoundError as err:
-        error = 'card_not_found', str(err)
-    except HomeAssistantError as err:
-        error = 'save_error', str(err)
-
-    if error is not None:
-        message = websocket_api.error_message(msg['id'], *error)
-
-    connection.send_message(message)
-
-
-@websocket_api.async_response
-async def websocket_lovelace_add_card(hass, connection, msg):
-    """Add new card to view over websocket and save."""
-    error = None
-    try:
-        await hass.async_add_executor_job(
-            add_card, hass.config.path(LOVELACE_CONFIG_FILE),
-            msg['view_id'], msg['card_config'], msg.get('position'),
-            msg.get('format', FORMAT_YAML))
-        message = websocket_api.result_message(
-            msg['id']
-        )
-    except FileNotFoundError:
-        error = ('file_not_found',
-                 'Could not find ui-lovelace.yaml in your config dir.')
-    except UnsupportedYamlError as err:
-        error = 'unsupported_error', str(err)
-    except ViewNotFoundError as err:
-        error = 'view_not_found', str(err)
-    except HomeAssistantError as err:
-        error = 'save_error', str(err)
-
-    if error is not None:
-        message = websocket_api.error_message(msg['id'], *error)
-
-    connection.send_message(message)
-
-
-@websocket_api.async_response
-async def websocket_lovelace_move_card(hass, connection, msg):
-    """Move card to different position over websocket and save."""
-    error = None
-    try:
-        if 'new_view_id' in msg:
+    # 4. Handle storage files
+    new_store = Store[dict[str, Any]](
+        hass,
+        dashboard.CONFIG_STORAGE_VERSION,
+        dashboard.CONFIG_STORAGE_KEY.format(DOMAIN),
+    )
+    if await new_store.async_load() is None:
+        await new_store.async_save(old_data)
+        await old_store.async_remove()
+    else:
+        # This should not happen because "lovelace" was a forbidden dashboard
+        # url_path before this migration existed. Rename old file as backup
+        # to avoid data loss just in case.
+        with suppress(FileNotFoundError):
             await hass.async_add_executor_job(
-                move_card_view, hass.config.path(LOVELACE_CONFIG_FILE),
-                msg['card_id'], msg['new_view_id'], msg.get('new_position'))
-        else:
-            await hass.async_add_executor_job(
-                move_card, hass.config.path(LOVELACE_CONFIG_FILE),
-                msg['card_id'], msg.get('new_position'))
+                os.rename,
+                old_store.path,
+                old_store.path + "_old",
+            )
 
-        message = websocket_api.result_message(
-            msg['id']
+    _LOGGER.info("Successfully migrated default lovelace config to dashboard entry")
+
+    # 5. Set default panel to lovelace if not already configured
+    system_store = await frontend.async_system_store(hass)
+    core_data = system_store.data.get("core")
+    if core_data is None or core_data.get("default_panel") is None:
+        await system_store.async_set_item(
+            "core", {**(core_data or {}), "default_panel": DOMAIN}
         )
-    except FileNotFoundError:
-        error = ('file_not_found',
-                 'Could not find ui-lovelace.yaml in your config dir.')
-    except UnsupportedYamlError as err:
-        error = 'unsupported_error', str(err)
-    except ViewNotFoundError as err:
-        error = 'view_not_found', str(err)
-    except CardNotFoundError as err:
-        error = 'card_not_found', str(err)
-    except HomeAssistantError as err:
-        error = 'save_error', str(err)
-
-    if error is not None:
-        message = websocket_api.error_message(msg['id'], *error)
-
-    connection.send_message(message)
-
-
-@websocket_api.async_response
-async def websocket_lovelace_delete_card(hass, connection, msg):
-    """Delete card from lovelace over websocket and save."""
-    error = None
-    try:
-        await hass.async_add_executor_job(
-            delete_card, hass.config.path(LOVELACE_CONFIG_FILE),
-            msg['card_id'])
-        message = websocket_api.result_message(
-            msg['id']
-        )
-    except FileNotFoundError:
-        error = ('file_not_found',
-                 'Could not find ui-lovelace.yaml in your config dir.')
-    except UnsupportedYamlError as err:
-        error = 'unsupported_error', str(err)
-    except CardNotFoundError as err:
-        error = 'card_not_found', str(err)
-    except HomeAssistantError as err:
-        error = 'save_error', str(err)
-
-    if error is not None:
-        message = websocket_api.error_message(msg['id'], *error)
-
-    connection.send_message(message)
+        _LOGGER.info("Set default panel to 'lovelace' during migration")
